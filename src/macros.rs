@@ -6,7 +6,7 @@ macro_rules! history_up {
 
         let lines = match $self.history.prev() {
             Some(s) => {
-                $self.print_lines(&mut $stdout, &mut $c, &s, $colour)?;
+                $self.print_lines(&mut $stdout, $colour)?;
                 $c.lineno = s.len() - 1;
                 if $c.lineno > 0 {
                     queue!($stdout, cursor::MoveDown($c.lineno as u16))?;
@@ -60,7 +60,7 @@ macro_rules! history_down {
             queue!($stdout, cursor::MoveUp($c.lineno as u16))?;
         }
         $c.lineno = 0;
-        $self.print_lines(&mut $stdout, &mut $c, lines, $colour)?;
+        $self.print_lines(&mut $stdout, $colour)?;
 
         let s_len = lines[$c.lineno].chars().count();
 

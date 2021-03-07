@@ -61,6 +61,10 @@ pub struct Repl<L: LangInterface = DefaultLangInterface> {
     _lang_interface: PhantomData<L>,
     /// The async event stream for the REPL.
     event_stream: EventStream,
+
+    // Line variables
+    lines: Vec<String>,
+    c: Cursor,
 }
 
 impl Repl<DefaultLangInterface> {
@@ -91,6 +95,8 @@ impl Repl<DefaultLangInterface> {
             clear_keyword: "clear",
             _lang_interface: PhantomData,
             event_stream: EventStream::new(),
+            lines: Vec::new(),
+            c: Cursor::default(),
         };
 
         if should_persist {
@@ -129,6 +135,8 @@ impl<L: LangInterface> Repl<L> {
             clear_keyword: "clear",
             _lang_interface: PhantomData,
             event_stream: EventStream::new(),
+            lines: Vec::new(),
+            c: Cursor::default(),
         };
 
         if should_persist {
@@ -180,14 +188,12 @@ impl<L: LangInterface> Repl<L> {
 
     /// Print a command
     fn print_lines(
-        &self,
+        &mut self,
         stdout: &mut std::io::Stdout,
-        c: &mut Cursor,
-        lines: &[String],
         colour: style::Color,
     ) -> crate::Result<()> {
-        if c.lineno > 0 {
-            queue!(stdout, cursor::MoveUp(c.lineno as u16))?;
+        if self.c.lineno > 0 {
+            queue!(stdout, cursor::MoveUp(self.c.lineno as u16))?;
         }
 
         queue!(
@@ -197,7 +203,7 @@ impl<L: LangInterface> Repl<L> {
         )?;
         let mut is_first = true;
 
-        for index in 0..lines.len() {
+        for index in 0..self.lines.len() {
             let leader = if is_first {
                 is_first = false;
                 self.leader
@@ -211,17 +217,17 @@ impl<L: LangInterface> Repl<L> {
                 style::SetForegroundColor(colour),
                 style::Print(leader),
             )?;
-            L::print_line(stdout, lines, index)?;
+            L::print_line(stdout, self.lines, index)?;
             queue!(stdout, style::Print("\n"))?;
         }
 
-        let leader_len = if c.lineno == 0 {
+        let leader_len = if self.c.lineno == 0 {
             self.leader_len
         } else {
             self.continued_leader_len
         };
 
-        c.charno = min(c.charno, lines[c.lineno].chars().count());
+        self.c.charno = min(self.c.charno, self.lines[self.c.lineno].chars().count());
 
         execute!(
             stdout,
@@ -233,19 +239,19 @@ impl<L: LangInterface> Repl<L> {
     /// The main function, gives the next command
     pub async fn next(&mut self, colour: style::Color) -> crate::Result<String> {
         let mut stdout = std::io::stdout();
-        let mut lines = Vec::new();
-        lines.push(String::new());
-
-        let mut c = Cursor::default();
+        let mut lines = &mut self.lines;
+        let mut c = &mut self.c;
 
         terminal::enable_raw_mode()?;
 
+        /*
         execute!(
             stdout,
             style::SetForegroundColor(colour),
             style::Print(self.leader),
             style::ResetColor
         )?;
+        */
 
         loop {
             match self.event_stream.next().await {
@@ -256,6 +262,13 @@ impl<L: LangInterface> Repl<L> {
                         {
                             terminal::disable_raw_mode()?;
                             return Ok(String::from("exit"));
+                        }
+                        event::KeyCode::Char('d')
+                            if e.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            terminal::disable_raw_mode()?;
+                            println!();
+                            return Ok(String::from("detach"));
                         }
                         event::KeyCode::Char('l')
                             if e.modifiers.contains(event::KeyModifiers::CONTROL) =>
@@ -269,7 +282,7 @@ impl<L: LangInterface> Repl<L> {
                                 cursor::MoveTo(0, 0)
                             )?;
                             let lines = self.cur(&c, &lines);
-                            self.print_lines(&mut stdout, &mut c, lines, colour)?;
+                            self.print_lines(&mut stdout, colour)?;
                             c.lineno = lineno;
                             c.charno = min(c.charno, lines[c.lineno].chars().count());
 
@@ -377,7 +390,7 @@ impl<L: LangInterface> Repl<L> {
                             lines[c.lineno] += &line;
 
                             execute!(stdout, cursor::MoveUp(1))?;
-                            self.print_lines(&mut stdout, &mut c, &lines, colour)?;
+                            self.print_lines(&mut stdout, colour)?;
                         }
 
                         // Regular delete, just need to delete one character
@@ -401,7 +414,7 @@ impl<L: LangInterface> Repl<L> {
                             let line = lines.remove(c.lineno + 1);
                             lines[c.lineno] += &line;
 
-                            self.print_lines(&mut stdout, &mut c, &lines, colour)?;
+                            self.print_lines(&mut stdout, colour)?;
                         }
 
                         event::KeyCode::Enter => {
@@ -455,7 +468,7 @@ impl<L: LangInterface> Repl<L> {
                                 c.charno = indent;
                                 lines.insert(c.lineno, " ".repeat(indent));
                                 execute!(stdout, style::Print("\n"))?;
-                                self.print_lines(&mut stdout, &mut c, &lines, colour)?;
+                                self.print_lines(&mut stdout, colour)?;
                             }
                         }
                         _ => {}
@@ -500,8 +513,12 @@ impl<L: LangInterface> Repl<L> {
         if c.use_history {
             self.history.push(self.history.cur().unwrap().clone());
         } else {
-            self.history.push(lines);
+            self.history.push(lines.to_vec());
         }
+
+        self.c = Cursor::default();
+        self.lines = Vec::new();
+        self.lines.push(String::new());
 
         Ok(src)
     }
@@ -521,7 +538,7 @@ fn get_byte_i(string: &str, i: usize) -> usize {
         .unwrap_or_else(|| string.len())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Cursor {
     use_history: bool,
     lineno: usize,
