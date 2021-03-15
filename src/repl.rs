@@ -44,9 +44,15 @@ pub struct Repl<L: LangInterface = DefaultLangInterface> {
     /// > <some-code>
     /// ^^- leader
     leader: &'static str,
+
+    attached: Option<usize>,
     /// The number of characters in the leader, it is stored here since getting number of characters
     /// is an `O(n)` operation for a utf-8 encoded string
     leader_len: usize,
+    /// The name of the attached module.
+    module: Option<&'static str>,
+    /// The length of the attached module string name.
+    module_len: usize,
     /// If the command is more than one line long, what to print on subsequent lines
     ///
     /// > <some-code>
@@ -61,6 +67,9 @@ pub struct Repl<L: LangInterface = DefaultLangInterface> {
     _lang_interface: PhantomData<L>,
     /// The async event stream for the REPL.
     event_stream: EventStream,
+    // Maintain future variables
+    lines: Vec<String>,
+    c: Cursor,
 }
 
 impl Repl<DefaultLangInterface> {
@@ -85,12 +94,17 @@ impl Repl<DefaultLangInterface> {
         let mut repl = Self {
             history: History::with_capacity(capacity, path),
             leader,
+            attached: None,
             leader_len: leader.chars().count(),
+            module: None,
+            module_len: 0,
             continued_leader,
             continued_leader_len: leader.chars().count(),
             clear_keyword: "clear",
             _lang_interface: PhantomData,
             event_stream: EventStream::new(),
+            lines: Vec::new(),
+            c: Cursor::default(),
         };
 
         if should_persist {
@@ -123,12 +137,17 @@ impl<L: LangInterface> Repl<L> {
         let mut repl = Self {
             history: History::with_capacity(capacity, path),
             leader,
+            attached: None,
             leader_len: leader.chars().count(),
+            module: None,
+            module_len: 0,
             continued_leader,
             continued_leader_len: leader.chars().count(),
             clear_keyword: "clear",
             _lang_interface: PhantomData,
             event_stream: EventStream::new(),
+            lines: Vec::new(),
+            c: Cursor::default(),
         };
 
         if should_persist {
@@ -152,6 +171,28 @@ impl<L: LangInterface> Repl<L> {
         } else {
             lines
         }
+    }
+
+    /// Inform the REPL we have selected a module.
+    pub fn module(&mut self, module: &'static str) {
+        self.module = Some(module);
+        self.module_len = module.len();
+    }
+
+    /// Inform the REPL we have exited from a module's context.
+    pub fn exit_module(&mut self) {
+        self.module = None;
+        self.module_len = 0;
+    }
+
+    /// Tell the REPL we have attached to a module
+    pub fn attach(&mut self, id: usize) {
+        self.attached = Some(id)
+    }
+
+    /// Tell the REPL we have detached from all modules.
+    pub fn detach(&mut self) {
+        self.attached = None
     }
 
     /// Easy access to the current line
@@ -198,11 +239,21 @@ impl<L: LangInterface> Repl<L> {
         let mut is_first = true;
 
         for index in 0..lines.len() {
-            let leader = if is_first {
-                is_first = false;
-                self.leader
-            } else {
-                self.continued_leader
+            let leader = match (is_first, self.attached) {
+                (true, Some(id)) => {
+                    is_first = false;
+                    format!("(Attached: {}) {}", id, self.leader)
+                }
+                (true, None) => {
+                    is_first = false;
+                    if let Some(name) = self.module {
+                        // If there is a module prepend it
+                        format!("{}{}", print_module_name(name), self.leader)
+                    } else {
+                        format!("{}", self.leader)
+                    }
+                }
+                (false, _) => self.continued_leader.to_string(),
             };
 
             queue!(
@@ -216,7 +267,16 @@ impl<L: LangInterface> Repl<L> {
         }
 
         let leader_len = if c.lineno == 0 {
-            self.leader_len
+            let extra_len = if let Some(id) = self.attached {
+                id.to_string().chars().count() + 13
+            } else {
+                if self.module.is_some() {
+                    self.module_len + 3 // Add the brackets around the name and space
+                } else {
+                    0
+                }
+            };
+            extra_len + self.leader_len
         } else {
             self.continued_leader_len
         };
@@ -230,24 +290,45 @@ impl<L: LangInterface> Repl<L> {
         )
     }
 
+    /// Resets the cursor and the lines after input has been received
+    fn reset_lines(&mut self) {
+        self.lines = Vec::new();
+        self.c = Cursor::default();
+    }
+
     /// The main function, gives the next command
     pub async fn next(&mut self, colour: style::Color) -> crate::Result<String> {
         let mut stdout = std::io::stdout();
-        let mut lines = Vec::new();
-        lines.push(String::new());
+        let mut lines = self.lines.clone();
+        let mut c = self.c.clone();
 
-        let mut c = Cursor::default();
+        let leader = if let Some(_id) = self.attached {
+            "".to_string()
+        } else {
+            terminal::enable_raw_mode()?;
+            if let Some(name) = self.module {
+                format!("{}{}", print_module_name(name), self.leader)
+            } else {
+                self.leader.to_string()
+            }
+        };
 
-        terminal::enable_raw_mode()?;
+        if lines.is_empty() {
+            lines.push(String::new());
 
-        execute!(
-            stdout,
-            style::SetForegroundColor(colour),
-            style::Print(self.leader),
-            style::ResetColor
-        )?;
+            execute!(
+                stdout,
+                style::SetForegroundColor(colour),
+                style::Print(&leader),
+                style::ResetColor
+            )?;
+        }
 
         loop {
+            // Update the temporary variables
+            self.lines = lines.clone();
+            self.c = c.clone();
+
             match self.event_stream.next().await {
                 Some(Ok(event::Event::Key(e))) => {
                     match e.code {
@@ -255,7 +336,27 @@ impl<L: LangInterface> Repl<L> {
                             if e.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
                             terminal::disable_raw_mode()?;
+                            self.reset_lines();
                             return Ok(String::from("exit"));
+                        }
+                        event::KeyCode::Char('d')
+                            if e.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            terminal::disable_raw_mode()?;
+                            println!();
+                            // Empty line
+                            self.reset_lines();
+                            execute!(stdout, style::SetForegroundColor(colour))?;
+                            return Ok(String::from("detach"));
+                        }
+                        event::KeyCode::Esc => {
+                            // Escapes from a module
+                            terminal::disable_raw_mode()?;
+                            println!();
+                            // Empty line
+                            self.reset_lines();
+                            execute!(stdout, style::SetForegroundColor(colour))?;
+                            return Ok(String::from("back"));
                         }
                         event::KeyCode::Char('l')
                             if e.modifiers.contains(event::KeyModifiers::CONTROL) =>
@@ -405,14 +506,24 @@ impl<L: LangInterface> Repl<L> {
                         }
 
                         event::KeyCode::Enter => {
+                            if self.attached.is_some() {
+                                terminal::disable_raw_mode()?;
+                                println!();
+                                // Empty line
+                                self.reset_lines();
+                                execute!(stdout, style::SetForegroundColor(colour))?;
+                                return Ok(String::from("detach"));
+                            }
+
                             if self.cur(&c, &lines[..])[0].trim().is_empty() {
                                 execute!(
                                     stdout,
                                     cursor::MoveToNextLine(1),
                                     style::SetForegroundColor(colour),
-                                    style::Print(self.leader)
+                                    style::Print(&leader)
                                 )?;
                                 // Empty line
+                                self.reset_lines();
                                 continue;
                             }
 
@@ -426,7 +537,7 @@ impl<L: LangInterface> Repl<L> {
                                         terminal::Clear(terminal::ClearType::All),
                                         cursor::MoveTo(0, 0),
                                         style::SetForegroundColor(colour),
-                                        style::Print(self.leader),
+                                        style::Print(&leader),
                                         style::ResetColor,
                                     )?;
 
@@ -462,12 +573,16 @@ impl<L: LangInterface> Repl<L> {
                     }
                 }
                 Some(Ok(_)) => {} // ignore other events
-                Some(Err(e)) => return Err(e),
+                Some(Err(e)) => {
+                    self.reset_lines();
+                    return Err(e);
+                }
                 None => {
+                    self.reset_lines();
                     return Err(crossterm::ErrorKind::IoError(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "Events ended",
-                    )))
+                    )));
                 }
             }
 
@@ -479,7 +594,16 @@ impl<L: LangInterface> Repl<L> {
             )?;
 
             let (leader, leader_len) = if c.lineno == 0 {
-                (self.leader, self.leader_len)
+                let extra_len = if let Some(id) = self.attached {
+                    id.to_string().chars().count() + 13
+                } else {
+                    if self.module.is_some() {
+                        self.module_len + 3 // Add the brackets around the name and space
+                    } else {
+                        0
+                    }
+                };
+                (leader.as_str(), extra_len + self.leader_len)
             } else {
                 (self.continued_leader, self.continued_leader_len)
             };
@@ -503,6 +627,7 @@ impl<L: LangInterface> Repl<L> {
             self.history.push(lines);
         }
 
+        self.reset_lines();
         Ok(src)
     }
 }
@@ -521,7 +646,12 @@ fn get_byte_i(string: &str, i: usize) -> usize {
         .unwrap_or_else(|| string.len())
 }
 
-#[derive(Debug, Default)]
+/// The format for printing a modules name
+fn print_module_name(name: &'static str) -> String {
+    format!("({}) ", name)
+}
+
+#[derive(Debug, Default, Clone)]
 struct Cursor {
     use_history: bool,
     lineno: usize,
