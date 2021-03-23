@@ -187,12 +187,13 @@ impl<L: LangInterface> Repl<L> {
 
     /// Tell the REPL we have attached to a module
     pub fn attach(&mut self, id: usize) {
-        self.attached = Some(id)
+        self.attached = Some(id);
     }
 
     /// Tell the REPL we have detached from all modules.
     pub fn detach(&mut self) {
-        self.attached = None
+        self.attached = None;
+        self.reset_lines();
     }
 
     /// Easy access to the current line
